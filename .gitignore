@@ -1,0 +1,7 @@
+.idea
+.vscode
+corpus
+__pycache__
+.DS_Store
+build
+.env
