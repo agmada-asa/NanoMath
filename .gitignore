@@ -5,3 +5,8 @@ __pycache__
 .DS_Store
 build
 .env
+
+# Hugging Face Spaces API contains duplicate files
+hf-space-api/build
+hf-space-api/model_architecture
+hf-space-api/config.py
