@@ -2,6 +2,8 @@
 
 NanoMath is a custom-built, GPT-style Large Language Model designed specifically to solve mathematical problems using Chain-of-Thought (CoT) reasoning. Built entirely from scratch in PyTorch, this project encompasses the entire lifecycle of an LLM: from synthetic data generation and custom tokenization to mixed-precision training and inference.
 
+**🌐 [Try it out here!](https://nano-math-web.vercel.app/)**
+
 
 ## 🚀 Project Overview
 
