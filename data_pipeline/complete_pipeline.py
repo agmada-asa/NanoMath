@@ -1,35 +1,46 @@
-"""
-Orchestrates the entire NanoMath data pipeline, running each data processing script sequentially.
-"""
+"""Run the NanoMath data pipeline with full or laptop-friendly dataset sizes."""
 
-import os
+import argparse
+from pathlib import Path
 import subprocess
 import sys
 
-def run_step(script_path):
-    """Executes a single python script via subprocess."""
-    print(f"\n========== RUNNING {os.path.basename(script_path)} ==========")
-    try:
-        # Run the script using the current Python executable
-        # check=True will raise an error if the script fails
-        subprocess.run([sys.executable, script_path], check=True)
-        print(f"========== FINISHED {os.path.basename(script_path)} ==========\n")
-    except subprocess.CalledProcessError:
-        print(f"\n!!!!!!!!!! ERROR in {os.path.basename(script_path)} !!!!!!!!!!")
-        print("Stopping pipeline.")
-        sys.exit(1) # Exit with an error code
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def run_step(script, *arguments):
+    command = [sys.executable, str(SCRIPT_DIR / script), *map(str, arguments)]
+    print(f"\n========== RUNNING {script} ==========")
+    subprocess.run(command, check=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--quick",
+        action="store_true",
+        help="Build a useful smoke-test corpus (10k synthetic + GSM8K + 10k Numina)",
+    )
+    parser.add_argument("--seed", type=int, default=1337)
+    args = parser.parse_args()
+
+    download_args = ["--max-numina", "10000"] if args.quick else []
+    synthetic_count = 10_000 if args.quick else 1_000_000
+    tokenizer_args = ["--max-documents", "30000"] if args.quick else []
+
+    run_step("download_data.py", *download_args)
+    run_step(
+        "generate_math_problems.py",
+        "--num-samples",
+        synthetic_count,
+        "--seed",
+        args.seed,
+    )
+    run_step("tokenizer.py", *tokenizer_args, "--seed", args.seed)
+    run_step("pre_tokenize.py")
+    print("\nPipeline complete.")
+
 
 if __name__ == "__main__":
-    # The list of scripts to run in order
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    scripts = [
-        os.path.join(script_dir, "download_data.py"),
-        os.path.join(script_dir, "generate_math_problems.py"),
-        os.path.join(script_dir, "tokenizer.py"),
-        os.path.join(script_dir, "pre_tokenize.py")
-    ]
-
-    for script_path in scripts:
-        run_step(script_path)
-
-    print("Pipeline complete! 🚀")
+    main()

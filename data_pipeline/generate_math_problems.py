@@ -3,6 +3,9 @@ Generates synthetic, Chain-of-Thought (CoT) basic math problems (addition, subtr
 multiplication, division, and basic word problems). The output is written to the 'corpus' directory.
 """
 
+import argparse
+from fractions import Fraction
+import math
 import os
 import random
 
@@ -234,10 +237,61 @@ def generate_word_problem():
     return q, t, final
 
 
+def generate_fraction_addition():
+    """Generate exact fraction addition with a reduced answer."""
+    b, d = random.randint(2, 12), random.randint(2, 12)
+    a, c = random.randint(1, b - 1), random.randint(1, d - 1)
+    result = Fraction(a, b) + Fraction(c, d)
+    common = math.lcm(b, d)
+    left, right = a * (common // b), c * (common // d)
+    answer = str(result.numerator) if result.denominator == 1 else f"{result.numerator}/{result.denominator}"
+    q = f"Calculate {a}/{b} + {c}/{d}. Give the fraction in simplest form."
+    t = (
+        f"The least common denominator of {b} and {d} is {common}.\n"
+        f"Rewrite the fractions: {a}/{b} = {left}/{common} and {c}/{d} = {right}/{common}.\n"
+        f"Add the numerators: ({left} + {right})/{common} = {left + right}/{common}.\n"
+        f"Reducing gives {answer}."
+    )
+    return q, t, answer
+
+
+def generate_percentage():
+    """Generate percentages whose result is exactly representable."""
+    percent = random.choice([5, 10, 20, 25, 40, 50, 60, 75])
+    base = random.randint(2, 200) * 20
+    result = base * percent // 100
+    q = f"What is {percent}% of {base}?"
+    t = (
+        f"{percent}% means {percent}/100. Multiply: "
+        f"({percent}/100) * {base} = {percent * base}/100 = {result}."
+    )
+    return q, t, result
+
+
+def generate_linear_equation():
+    """Generate a verified one-variable equation, including negative solutions."""
+    coefficient = random.randint(2, 12)
+    solution = random.randint(-30, 50)
+    offset = random.randint(-40, 40)
+    total = coefficient * solution + offset
+    sign = "+" if offset >= 0 else "-"
+    magnitude = abs(offset)
+    q = f"Solve for x: {coefficient}x {sign} {magnitude} = {total}."
+    inverse_total = total - offset
+    t = (
+        f"Undo the constant term: {total} - ({offset}) = {inverse_total}, "
+        f"so {coefficient}x = {inverse_total}.\n"
+        f"Divide both sides by {coefficient}: x = {inverse_total}/{coefficient} = {solution}.\n"
+        f"Check: {coefficient} * ({solution}) + ({offset}) = {total}."
+    )
+    return q, t, solution
+
+
 # --- Data Builder ---
 
-def build_dataset(num_samples=1000000):
+def build_dataset(num_samples=1000000, seed=1337):
     """Main loop building the full synthetic dataset with the requested number of samples."""
+    random.seed(seed)
     print(f"Generating {num_samples:,} diverse synthetic math problems...")
 
     generators = [
@@ -245,7 +299,10 @@ def build_dataset(num_samples=1000000):
         generate_subtraction,
         generate_multiplication,
         generate_division,
-        generate_word_problem
+        generate_word_problem,
+        generate_fraction_addition,
+        generate_percentage,
+        generate_linear_equation,
     ]
 
     with open(output_file, 'w', encoding='utf-8') as f:
@@ -271,5 +328,8 @@ def build_dataset(num_samples=1000000):
 
 
 if __name__ == "__main__":
-    # Generates 1 million samples. You can adjust this number.
-    build_dataset(1000000)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--num-samples", type=int, default=1_000_000)
+    parser.add_argument("--seed", type=int, default=1337)
+    arguments = parser.parse_args()
+    build_dataset(arguments.num_samples, arguments.seed)

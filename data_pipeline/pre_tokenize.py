@@ -1,77 +1,90 @@
-"""
-Pre-tokenizes the entire compiled text dataset into binary (.bin) files (train/val splits).
-This allows for highly efficient streaming directly from disk to GPU during training.
-"""
+"""Stream document files into aligned token and assistant-loss-weight binaries."""
 
-import os
-import sentencepiece as spm
+import argparse
+from pathlib import Path
+
 import numpy as np
+import sentencepiece as spm
 
-# --- Configuration ---
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-corpus_dir = os.path.join(PROJECT_ROOT, "corpus")
-build_dir = os.path.join(PROJECT_ROOT, "build")
-input_file = os.path.join(corpus_dir, "Final_Data.txt")
-tokenizer_path = os.path.join(build_dir, "token.model")
 
-# Output files
-temp_file = os.path.join(corpus_dir, "temp_all.bin")
-train_file = os.path.join(corpus_dir, "train.bin")
-val_file = os.path.join(corpus_dir, "val.bin")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SEPARATOR = b"<|FILE_SEP|>"
 
-# 1. Load the Tokenizer
-print(f"Loading tokenizer from {tokenizer_path}...")
-sp = spm.SentencePieceProcessor()
-sp.load(tokenizer_path)
-vocab_size = sp.get_piece_size()
 
-# Safety check for uint16
-if vocab_size > 65535:
-    raise ValueError(f"Vocab size {vocab_size} is too large for uint16!")
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--corpus-dir", type=Path, default=PROJECT_ROOT / "corpus")
+    parser.add_argument("--tokenizer", type=Path, default=PROJECT_ROOT / "build/token.model")
+    return parser.parse_args()
 
-# 2. Pass 1: Tokenize Everything to a Temp File
-print(f"Phase 1: Tokenizing {input_file} into a single binary...")
-token_count = 0
 
-with open(input_file, "r", encoding="utf-8") as f_in, \
-        open(temp_file, "wb") as f_out:
-    for i, line in enumerate(f_in):
-        # We assume the line contains valuable newlines/formatting
-        ids = sp.encode_as_ids(line)
+def iter_records(path, chunk_size=1024 * 1024):
+    """Split a potentially huge file without loading it into memory."""
+    buffer = b""
+    with path.open("rb") as source:
+        while chunk := source.read(chunk_size):
+            buffer += chunk
+            parts = buffer.split(SEPARATOR)
+            buffer = parts.pop()
+            for part in parts:
+                if part.strip():
+                    yield part.decode("utf-8")
+    if buffer.strip():
+        yield buffer.decode("utf-8")
 
-        # Convert to numpy uint16
-        data = np.array(ids, dtype=np.uint16)
 
-        # Write bytes directly to disk
-        f_out.write(data.tobytes())
+def token_weights(ids, assistant_id, answer_id, end_id):
+    if assistant_id not in ids:
+        return [1] * len(ids)
+    weights = []
+    mode = 0
+    for token_id in ids:
+        if token_id == assistant_id:
+            weights.append(0)
+            mode = 1
+        elif token_id == answer_id and mode:
+            weights.append(1)
+            mode = 3
+        elif token_id == end_id and mode:
+            weights.append(1)
+            mode = 0
+        else:
+            weights.append(mode)
+    return weights
 
-        token_count += len(ids)
 
-        if i % 100000 == 0:
-            print(f"Tokenizing line {i}...", end='\r')
+def encode_split(tokenizer, input_path, token_path, weight_path):
+    assistant_id = tokenizer.piece_to_id("<|assistant|>")
+    answer_id = tokenizer.piece_to_id("<|answer|>")
+    end_id = tokenizer.piece_to_id("<|end|>")
+    total = documents = 0
+    with token_path.open("wb") as token_file, weight_path.open("wb") as weight_file:
+        for documents, record in enumerate(iter_records(input_path), start=1):
+            ids = tokenizer.encode_as_ids(record)
+            weights = token_weights(ids, assistant_id, answer_id, end_id)
+            ids.append(tokenizer.eos_id())
+            weights.append(1)
+            np.asarray(ids, dtype=np.uint16).tofile(token_file)
+            np.asarray(weights, dtype=np.uint8).tofile(weight_file)
+            total += len(ids)
+            if documents % 100_000 == 0:
+                print(f"  {documents:,} documents / {total:,} tokens")
+    print(f"{input_path.name}: {documents:,} documents / {total:,} tokens")
 
-print(f"\nTokenization complete. Total tokens: {token_count:,}")
 
-# 3. Pass 2: Split into Train/Val
-print("Phase 2: Splitting into Train (90%) and Val (10%)...")
+def main():
+    args = parse_args()
+    tokenizer = spm.SentencePieceProcessor(model_file=str(args.tokenizer))
+    if tokenizer.get_piece_size() > np.iinfo(np.uint16).max:
+        raise SystemExit("Tokenizer is too large for uint16 storage")
+    for split in ("train", "val"):
+        encode_split(
+            tokenizer,
+            args.corpus_dir / f"{split}.txt",
+            args.corpus_dir / f"{split}.bin",
+            args.corpus_dir / f"{split}_weights.bin",
+        )
 
-# Calculate the split index
-n = int(0.9 * token_count)
 
-# We use memmap to open the huge file as if it were an array in RAM
-# mode='r' means read-only, we won't modify the temp file
-all_tokens = np.memmap(temp_file, dtype=np.uint16, mode='r', shape=(token_count,))
-
-# Save the slices
-# We use .tofile() to save the raw binary data
-print(f"Writing {n:,} tokens to {train_file}...")
-train_data = all_tokens[:n]
-with open(train_file, "wb") as f:
-    f.write(train_data.tobytes())
-
-print(f"Writing {token_count - n:,} tokens to {val_file}...")
-val_data = all_tokens[n:]
-with open(val_file, "wb") as f:
-    f.write(val_data.tobytes())
-
-print("\nDone! Binary datasets are ready.")
+if __name__ == "__main__":
+    main()
