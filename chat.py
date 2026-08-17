@@ -1,111 +1,158 @@
-import os
-import torch
+"""Local NanoMath CLI with Apple-Silicon acceleration and cached decoding."""
+
+import argparse
+from pathlib import Path
+import time
+
 import sentencepiece as spm
+import torch
+
+from config import get_device, get_hyperparams
 from model_architecture.gpt_language_model import GPTLanguageModel
-from config import get_hyperparams
 
-# --- 1. Hyperparameters & Setup ---
-CONFIG = get_hyperparams()
-block_size = CONFIG["block_size"]
-n_embd = CONFIG["n_embd"]
-n_head = CONFIG["n_head"]
-n_layer = CONFIG["n_layer"]
 
-if torch.cuda.is_available():
-    device = 'cuda'
-elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    device = 'mps'
-else:
-    device = 'cpu'
+PROJECT_ROOT = Path(__file__).resolve().parent
+MODEL_KEYS = {
+    "vocab_size",
+    "n_embd",
+    "block_size",
+    "n_head",
+    "n_layer",
+    "dropout",
+    "n_kv_head",
+    "norm_type",
+    "mlp_type",
+    "position_encoding",
+    "tie_embeddings",
+    "bias",
+}
 
-MAX_TOKENS = 200
 
-print(f"Loading model on {device}...")
+def _strip_wrapper_prefixes(state_dict):
+    cleaned = {}
+    for key, value in state_dict.items():
+        while key.startswith(("_orig_mod.", "module.")):
+            key = key.split(".", 1)[1]
+        cleaned[key] = value
+    return cleaned
 
-# --- 2. Load Tokenizer & Apply Vocab Padding ---
-tokenizer_path = os.path.join("build", "token.model")
-sp = spm.SentencePieceProcessor()
-sp.load(tokenizer_path)
-vocab_size = sp.get_piece_size()
 
-# We must pad the vocab exactly like we did in training
-if vocab_size % 128 != 0:
-    vocab_size = ((vocab_size // 128) + 1) * 128
+def load_model(weights_path, tokenizer, device, dtype):
+    checkpoint = torch.load(weights_path, map_location="cpu", weights_only=True)
+    if "model" in checkpoint and isinstance(checkpoint["model"], dict):
+        state_dict = checkpoint["model"]
+        model_config = dict(checkpoint["model_config"])
+    else:
+        # Published NanoMath weights predate metadata checkpoints.
+        state_dict = checkpoint
+        model_config = get_hyperparams("legacy")
 
-# --- 3. Initialize Model ---
-# We force dropout to 0.0 for inference
-model = GPTLanguageModel(
-    vocab_size=vocab_size,
-    n_embd=n_embd,
-    block_size=block_size,
-    n_head=n_head,
-    n_layer=n_layer,
-    device=device,
-    dropout=0.0
-)
+    state_dict = _strip_wrapper_prefixes(state_dict)
+    token_weight = state_dict.get("token_embedding_table.weight")
+    if token_weight is not None:
+        model_config["vocab_size"] = token_weight.shape[0]
+        model_config["n_embd"] = token_weight.shape[1]
+    else:
+        vocab_size = tokenizer.get_piece_size()
+        model_config["vocab_size"] = (vocab_size + 127) // 128 * 128
 
-# --- 4. Load the Trained Weights ---
-# Depending on how long you trained for, you might need to change this to:
-# "latest_checkpoint.pth" or "model_wights.pth", since Kaggle limits to 12 hours of training time
-weights_path = os.path.join("build", "model_weights.pth") 
+    position_weight = state_dict.get("position_embedding_table.weight")
+    if position_weight is not None:
+        model_config["block_size"] = position_weight.shape[0]
+    model_args = {key: value for key, value in model_config.items() if key in MODEL_KEYS}
+    model_args["dropout"] = 0.0
 
-try:
-    state_dict = torch.load(weights_path, map_location=device, weights_only=True)
+    model = GPTLanguageModel(**model_args)
+    model.load_state_dict(state_dict, strict=True)
+    model.to(device=device, dtype=dtype).eval()
+    return model, model_config
 
-    # Clean up prefixes if they exist (from torch.compile or accelerate)
-    new_state_dict = {}
-    for k, v in state_dict.items():
-        if k.startswith('_orig_mod.'):
-            new_state_dict[k[10:]] = v
-        elif k.startswith('module.'):
-            new_state_dict[k[7:]] = v
-        else:
-            new_state_dict[k] = v
 
-    model.load_state_dict(new_state_dict)
-    print("Successfully loaded model weights!")
-except FileNotFoundError:
-    print(f"ERROR: Could not find '{weights_path}'. Make sure your training finished and saved the file.")
-    exit()
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--weights", type=Path, default=PROJECT_ROOT / "build/model_weights.pth")
+    parser.add_argument("--tokenizer", type=Path, default=PROJECT_ROOT / "build/token.model")
+    parser.add_argument("--device", choices=("auto", "mps", "cuda", "cpu"), default="auto")
+    parser.add_argument("--dtype", choices=("auto", "float32", "float16"), default="auto")
+    parser.add_argument("--max-tokens", type=int, default=200)
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="0 uses deterministic greedy decoding (recommended for maths)",
+    )
+    parser.add_argument("--top-k", type=int, default=None)
+    parser.add_argument("--no-kv-cache", action="store_true", help="Debug the slower legacy decoder")
+    parser.add_argument("--show-speed", action="store_true")
+    parser.add_argument("prompt", nargs="*", help="Run one prompt instead of opening interactive mode")
+    return parser.parse_args()
 
-model.to(device)
-model.eval()
 
-print(f"Model Size: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M parameters")
+def main():
+    args = parse_args()
+    one_shot_prompt = " ".join(args.prompt) if args.prompt else None
+    device = get_device(args.device)
+    dtype_name = args.dtype
+    if dtype_name == "auto":
+        dtype_name = "float16" if device in {"mps", "cuda"} else "float32"
+    dtype = {"float16": torch.float16, "float32": torch.float32}[dtype_name]
+    if not args.tokenizer.exists() or not args.weights.exists():
+        raise SystemExit(
+            "Missing model files. Put token.model and model_weights.pth in build/, "
+            "or pass --tokenizer and --weights. See README.md for the download command."
+        )
 
-# --- 5. The Chat Loop ---
-print("\n" + "=" * 30)
-print("🤖 NanoMath is Ready")
-print("Type 'quit' to exit.")
-print("=" * 30 + "\n")
+    tokenizer = spm.SentencePieceProcessor(model_file=str(args.tokenizer))
+    print(f"Loading {args.weights.name} on {device}...")
+    model, model_config = load_model(args.weights, tokenizer, device, dtype)
+    parameters = sum(parameter.numel() for parameter in model.parameters())
+    print(
+        f"Ready: {parameters / 1e6:.2f}M parameters, {dtype_name}, "
+        f"{model_config.get('position_encoding', 'learned')} positions, KV cache on"
+    )
 
-while True:
-    user_input = input("You: ")
-    if user_input.lower() in ['quit', 'exit']:
-        break
+    end_id = tokenizer.piece_to_id("<|end|>")
+    stop_ids = None if end_id == tokenizer.unk_id() else [end_id]
 
-    # Format the prompt exactly how the model saw it in training
-    prompt = f"<|user|> {user_input} <|end|>\n<|assistant|>"
+    def answer(user_input):
+        prompt = f"<|user|> {user_input} <|end|>\n<|assistant|>"
+        prompt_ids = tokenizer.encode_as_ids(prompt)
+        context = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+        started = time.perf_counter()
+        generated = model.generate(
+            context,
+            max_new_tokens=args.max_tokens,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            stop_token_ids=stop_ids,
+            use_cache=not args.no_kv_cache,
+        )
+        if device == "mps":
+            torch.mps.synchronize()
+        elapsed = time.perf_counter() - started
+        new_tokens = generated[0, context.size(1) :].tolist()
+        text = tokenizer.decode(new_tokens).split("<|end|>", 1)[0].strip()
+        print(f"NanoMath: {text}")
+        if args.show_speed:
+            print(f"[{len(new_tokens) / max(elapsed, 1e-9):.1f} tokens/s]")
 
-    # Encode and send to device
-    context = torch.tensor([sp.encode_as_ids(prompt)], dtype=torch.long, device=device)
+    if one_shot_prompt:
+        answer(one_shot_prompt)
+        return
 
-    print("NanoMath: ", end="", flush=True)
+    print("Type 'quit' to exit. Greedy decoding is enabled for arithmetic.\n")
+    while True:
+        try:
+            user_input = input("You: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if user_input.lower() in {"quit", "exit"}:
+            break
+        if user_input:
+            answer(user_input)
+            print()
 
-    # Generate the full response at once (much faster!)
-    with torch.no_grad():
-        # Adjust temperature: 0.7 is good, lower (0.5) is more strictly mathematical
-        generated_ids = model.generate(context, max_new_tokens=MAX_TOKENS, temperature=0.7)
 
-    # Extract only the newly generated tokens (ignore the prompt we fed it)
-    new_tokens = generated_ids[0][len(context[0]):].tolist()
-
-    # Decode to text
-    response_text = sp.decode(new_tokens)
-
-    # Clean up the output (stop at the end token if it generated one)
-    if "<|end|>" in response_text:
-        response_text = response_text.split("<|end|>")[0].strip()
-
-    print(response_text)
-    print("\n" + "-" * 20)
+if __name__ == "__main__":
+    main()
