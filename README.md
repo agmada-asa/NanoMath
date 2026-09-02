@@ -1,31 +1,30 @@
 # NanoMath
 
-NanoMath is a GPT-style maths model with a complete data, training, and inference stack. This version preserves compatibility with the published 136M checkpoint while adding faster Apple-Silicon inference, a local corpus builder, and a self-contained single/dual-GPU Kaggle training build.
+NanoMath is a compact decoder-only language model for maths reasoning, written from scratch in PyTorch. The project covers the full model lifecycle: data preparation, tokenizer training, single and multi-GPU training, checkpointing, and local inference.
 
-## Run it locally
+The current Hugging Face release is NanoMath v1.1. It has 113.27 million parameters, a 16,384-piece SentencePiece tokenizer, a 1,024-token context window, and a metadata-rich checkpoint that records the exact model configuration. Despite its size, it produces readable multi-step solutions and handled division, multiplication, a word problem, and a linear equation correctly in the current spot check.
 
-This checkout already has the published files in `build/` (they are intentionally ignored by Git). On a fresh clone:
+NanoMath is an educational model rather than a calculator. Its correct answers show how much a small purpose-trained model can learn, while its mistakes make the remaining limits easy to inspect. See [observed outputs](#observed-outputs) for examples from the published v1.1 checkpoint.
+
+## Run the published model
 
 ```bash
+git clone https://github.com/agmada-asa/NanoMath.git
+cd NanoMath
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 hf download agmadaasa/NanoMath model_weights.pth token.model --local-dir build
+python chat.py "What is 84 / 7?"
 ```
 
-Ask one question:
-
-```bash
-python chat.py "What is 48 / 6?"
-```
-
-Or start an interactive session:
+Start an interactive session with:
 
 ```bash
 python chat.py
 ```
 
-The CLI automatically chooses CUDA, Apple MPS, or CPU. It uses deterministic greedy decoding by default because sampling is usually counterproductive for arithmetic. Every answer comes directly from the model weights; there is no calculator, parser, or symbolic-solver fallback.
+The CLI selects CUDA, Apple MPS, or CPU automatically. Greedy decoding is the default because sampling usually makes arithmetic less consistent.
 
 Useful options:
 
@@ -35,84 +34,81 @@ python chat.py --temperature 0.5 --top-k 40 "Write a new maths problem"
 python chat.py --no-kv-cache --show-speed "What is 48 / 6?"
 ```
 
-## What was optimized
+## Published versions
 
-### Inference
+| Version | Parameters | Architecture | Tokenizer | Status |
+|---|---:|---|---:|---|
+| v1.1 | 113.27M | 16 layers, RoPE, RMSNorm, SwiGLU, grouped-query attention | 16,384 | Current |
+| v1.0 | 136.18M | 12 layers, learned positions, LayerNorm, ReLU | 32,768 | Retained in Hugging Face history |
 
-- Per-layer KV caching avoids recomputing the full prompt for every generated token.
-- Generation stops on the token ID directly instead of generating all 200 tokens and trimming text afterward.
-- Greedy decoding avoids a full softmax and multinomial sample when temperature is zero.
-- FP16 inference is selected automatically on MPS/CUDA, roughly halving weight memory; `--dtype float32` remains available.
-- Model positions follow the input tensor's actual device, so moving between CPU, MPS, and CUDA is reliable.
-- Both raw legacy checkpoints and new metadata-rich resumable checkpoints load automatically.
+To fetch a specific release, add `--revision v1.1` or `--revision v1.0` to the `hf download` command. A checkpoint and tokenizer must come from the same release.
 
-Low-impact benchmark on an 18 GB M3 Pro, using the full 136.18M architecture in FP16, a 128-token prompt, and 12 generated tokens:
+The v1.1 checkpoint completed optimizer step 5,999 on two NVIDIA T4 GPUs. Its training build contains 641,276,817 train tokens and 13,076,780 validation tokens. The checkpoint SHA-256 is:
 
-| Decoder | Tokens/second | Relative speed |
-|---|---:|---:|
-| Full-context recomputation | 41.7 | 1.0x |
-| KV cache | 258.5 | 6.2x |
-
-Run the same short benchmark on another machine:
-
-```bash
-python benchmark.py --profile legacy --new-tokens 12
+```text
+f13f762b64ec710221575b6f5d4dae05f6105d8234b8a53a35ea7b40680f6dca
 ```
 
-### Training
+## Observed outputs
 
-`train.py` replaces the notebook-only training loop and adds:
+These results came from the published v1.1 checkpoint with greedy decoding and a 200-token limit. It solved four of the six mixed prompts correctly. This is a reproducible spot check, not an accuracy benchmark.
 
-- native MPS, CUDA, and CPU execution;
-- vectorized random batches from memory-mapped token files;
-- assistant/answer-weighted loss when weight files are present;
-- correct AdamW decay groups, gradient clipping, cosine decay, and warmup;
-- CUDA BF16/FP16 autocast and fused AdamW where supported;
-- resumable checkpoints containing model and training configuration;
-- optional `torch.compile` (normally best on CUDA; deliberately off by default on MPS);
-- automatic multi-GPU DDP when launched with `torchrun`, without redundant gradient synchronization during accumulation;
-- native grouped-query CUDA attention on recent PyTorch builds, with a portable fallback;
-- an optional wall-clock cutoff that writes both resumable and inference checkpoints before Kaggle expires;
-- small validation runs and infrequent checkpoints to reduce disruption.
+| Prompt | Model's final answer | Expected | Result |
+|---|---|---:|---|
+| `What is 84 / 7?` | `12` | 12 | Correct |
+| `Calculate 57 + 68.` | `89` | 125 | Incorrect |
+| `What is 17 * 24?` | `408` | 408 | Correct |
+| `A box has 15 pencils. Six are removed and four are added. How many pencils are in the box?` | `13` | 13 | Correct |
+| `Solve 3x + 5 = 20.` | `5` | 5 | Correct |
+| `Which is larger, 5/8 or 2/3?` | Lost the original numerators and did not finish within 200 tokens | 2/3 | Incorrect |
 
-Four profiles are available:
+For the incorrect addition, the model produced fluent but invalid subtraction steps:
 
-| Profile | Parameters with intended vocab | Purpose |
-|---|---:|---|
-| `legacy` | 136.18M / 32,768 pieces | Published checkpoint compatibility |
-| `mac` | 32.0M / 16,384 pieces | Recommended Apple-Silicon training |
-| `kaggle` | About 113M / 16,384 pieces | New 16-layer CUDA architecture for one or two 16 GB GPUs |
-| `tiny` | Under 5M | Pipeline tests and experimentation |
+```text
+<|thinking|> To solve 57 + 68, we align the numbers by place value and add from right to left. Aligning 57 over 68: - In the ones column, 7 is less than 8, so we must borrow. ... Combining the columns, the final answer is 89. <|answer|> 89
+```
 
-The `mac` profile uses RoPE, RMSNorm, SwiGLU, grouped-query attention, bias-free projections, tied input/output embeddings, and a 512-token context. It is a new architecture and cannot load the legacy weights; train it from scratch. Its smaller vocabulary and tied embeddings save a large fraction of the original model's output-head compute, which matters on a laptop.
+For a 113M model, producing consistent solution structure across these different problem types is a useful result. The remaining limitation is arithmetic reliability: the reasoning format makes a mistake easy to inspect, but it cannot guarantee that the result is correct.
 
-### Mathematical learning signal
+## Model architecture
 
-- Training and validation are split by complete problems rather than at an arbitrary token boundary.
-- Each example ends with EOS, preventing unrelated problems from running together.
-- Prompt tokens receive zero loss weight, reasoning tokens weight 1, and final-answer tokens weight 3. This spends capacity on solving rather than memorizing user text.
-- The synthetic curriculum now includes exact fractions, percentages, and verified linear equations in addition to arithmetic and word problems.
-- Synthetic generation and document shuffling are seeded and reproducible.
-- The default tokenizer is reduced from 32K to 16K, keeps digits split, reserves maths symbols, and has byte fallback.
-- Downloads overwrite prior corpus files instead of silently duplicating examples on repeated runs.
+The v1.1 `kaggle` profile uses:
 
-These changes affect mathematical ability only after training or fine-tuning; inference never substitutes an externally calculated answer.
+- 16 decoder blocks with width 768
+- 12 query heads and 4 key-value heads
+- rotary position embeddings
+- RMSNorm and SwiGLU
+- tied token and output embeddings
+- bias-free projections
+- a 1,024-token context window
 
-## Build training data
+Inference uses a per-layer key-value cache, direct stop-token detection, and FP16 on MPS or CUDA. On older PyTorch builds and non-CUDA devices, grouped-query attention expands key and value tensors to a compatible view.
 
-The quick pipeline creates a practical development corpus: GSM8K, 10,000 streamed NuminaMath examples, and 10,000 synthetic examples.
+The loader also understands the raw v1.0 checkpoint. It infers the legacy dimensions from the saved tensors when checkpoint metadata is absent.
+
+## Training data and loss
+
+The corpus combines GSM8K, NuminaMath, and generated arithmetic problems. Each example uses role and reasoning markers such as `<|user|>`, `<|thinking|>`, `<|answer|>`, and `<|end|>`.
+
+Data preparation splits complete problems between training and validation before tokenization. It writes packed `uint16` token streams and aligned `uint8` loss weights. Prompt tokens receive weight 0, reasoning tokens weight 1, and final-answer tokens weight 3.
+
+The generated curriculum includes arithmetic, exact fractions, percentages, linear equations, and word problems. Generation and document shuffling use explicit seeds.
+
+## Build the data
+
+The quick pipeline downloads a smaller development corpus and generates 10,000 synthetic examples:
 
 ```bash
 python data_pipeline/complete_pipeline.py --quick
 ```
 
-The complete pipeline is much larger and can take substantial time and disk space:
+Build the full corpus with:
 
 ```bash
 python data_pipeline/complete_pipeline.py
 ```
 
-Individual stages remain configurable:
+Run individual stages when you need more control:
 
 ```bash
 python data_pipeline/download_data.py --max-numina 50000
@@ -121,62 +117,49 @@ python data_pipeline/tokenizer.py --vocab-size 16384 --seed 1337
 python data_pipeline/pre_tokenize.py
 ```
 
-The resulting files are `corpus/train.bin`, `corpus/val.bin`, and aligned `*_weights.bin` files. All large build artifacts are ignored by Git.
+The resulting files are `corpus/train.bin`, `corpus/val.bin`, `corpus/train_weights.bin`, and `corpus/val_weights.bin`.
 
 ## Train on Kaggle
 
-Build the corpus and tokenizer locally, then create a flat, upload-ready Kaggle dataset:
+Package the corpus, tokenizer, and matching source code:
 
 ```bash
-python data_pipeline/complete_pipeline.py
-python prepare_kaggle_dataset.py \
-  --dataset-id agmadaasa/nanomath-kaggle-v2
+python prepare_kaggle_dataset.py --dataset-id agmadaasa/nanomath-kaggle-v2
 ```
 
-The package is written to `build/kaggle_dataset/`. It contains:
+The command writes an upload-ready directory to `build/kaggle_dataset/`. Its manifest records file sizes, token counts, dtypes, profile settings, and SHA-256 checksums.
 
-- `train.bin` and `val.bin`: packed little-endian `uint16` token streams;
-- aligned `train_weights.bin` and `val_weights.bin`: `uint8` loss weights;
-- `token.model` and a manifest containing the vocabulary size, token counts, dtypes, profile, sizes, and SHA-256 checksums;
-- `nanomath-source.tar.gz`: the exact trainer and model source needed by the offline notebook;
-- `dataset-metadata.json`: metadata consumed by the Kaggle CLI.
-
-Upload it with your configured Kaggle credentials:
+Create the Kaggle dataset or publish a new version:
 
 ```bash
 python3 -m kaggle datasets create -p build/kaggle_dataset
-```
-
-If that dataset slug already exists, publish the package as a new version instead:
-
-```bash
 python3 -m kaggle datasets version -p build/kaggle_dataset -m "refresh training corpus"
 ```
 
-Then import `kaggle-notebook.ipynb` into Kaggle, attach that private dataset, select a GPU accelerator, and run all cells. The notebook verifies the package, extracts the matching source, and uses one GPU directly or every visible GPU through DDP. Its defaults train the `kaggle` profile with native FP16 on T4/P100 GPUs, BF16 on Ampere or newer GPUs, fused AdamW, fused/memory-efficient SDPA, gradient accumulation, `torch.compile`, checkpointing every 500 steps, and a clean stop after 680 minutes.
+Import `kaggle-notebook.ipynb`, attach the dataset, select a GPU accelerator, and run the notebook. It verifies the packaged files before training and starts Distributed Data Parallel when Kaggle exposes more than one GPU.
 
-Kaggle writes two useful artifacts to `/kaggle/working`:
+Kaggle writes two checkpoints to `/kaggle/working`:
 
-- `model_weights.pth`: compact metadata-rich model weights for inference;
-- `latest_checkpoint.pth`: model, optimizer, scaler, and step state for a resumable Kaggle session.
+- `model_weights.pth` contains the model, model configuration, and training metadata needed for inference.
+- `latest_checkpoint.pth` also contains optimizer and scaler state for resuming training.
 
-To continue training, upload `latest_checkpoint.pth` as a private dataset, attach it, and set `RESUME_CHECKPOINT` in the notebook. Architecture settings are checked before resume so an incompatible profile fails immediately.
+To continue in another session, attach `latest_checkpoint.pth`, set `RESUME_CHECKPOINT` in the notebook, and raise `MAX_ITERS` above the saved step.
 
-## Train on a Mac
+## Train locally
 
-Start with a short check:
+Run a short pipeline check first:
 
 ```bash
 python train.py --profile tiny --max-iters 20
 ```
 
-For the recommended model:
+The `mac` profile is sized for Apple Silicon:
 
 ```bash
 python train.py --profile mac
 ```
 
-To keep more headroom for video calls and screen sharing, reduce the physical batch and CPU threads. Gradient accumulation preserves a useful effective batch:
+Reduce the physical batch and CPU use when the machine needs more headroom:
 
 ```bash
 python train.py --profile mac \
@@ -185,27 +168,30 @@ python train.py --profile mac \
   --cpu-threads 2
 ```
 
-Resume an interrupted run:
+Resume an interrupted run with:
 
 ```bash
 python train.py --profile mac --resume build/latest_checkpoint.pth
 ```
 
-Do not switch profiles when resuming: architecture settings must match the checkpoint. Full training was intentionally not run during optimization; only unit tests, short inference benchmarks, a real-checkpoint query, and a one-step tiny MPS training smoke test were used.
+Do not change architecture profiles when resuming. The trainer checks the saved model configuration and rejects incompatible settings.
 
-### Fine-tune the published weights for arithmetic
+## Fine-tune v1.0
 
-To improve the existing 136M model rather than start a new architecture, compile the verified corpus while retaining its published 32K tokenizer:
+The legacy profile is available for experiments with the original 136M model. Download both v1.0 files first:
 
 ```bash
-python data_pipeline/generate_math_problems.py --num-samples 100000 --seed 1337
-python data_pipeline/tokenizer.py --reuse-tokenizer --seed 1337
-python data_pipeline/pre_tokenize.py --tokenizer build/token.model
+hf download agmadaasa/NanoMath \
+  model_weights.pth token.model \
+  --revision v1.0 \
+  --local-dir build
 ```
 
-Then fine-tune with short sequences and a conservative learning rate. This changes the weights themselves; no answer-time calculator is involved:
+Reuse that tokenizer when compiling data, then initialize the legacy profile from the downloaded weights:
 
 ```bash
+python data_pipeline/tokenizer.py --reuse-tokenizer --seed 1337
+python data_pipeline/pre_tokenize.py --tokenizer build/token.model
 python train.py \
   --profile legacy \
   --init-from build/model_weights.pth \
@@ -217,7 +203,11 @@ python train.py \
   --output build/model_weights_arithmetic.pth
 ```
 
-Use fewer iterations for an initial quality check. Fine-tuning the 136M checkpoint is materially heavier than the smoke tests and was not started automatically while the Mac was needed for a meeting.
+## Web app
+
+[NanoMathWeb](https://github.com/agmada-asa/NanoMathWeb) sends requests to the [NanoMath API Space](https://huggingface.co/spaces/agmadaasa/NanoMath-api). The frontend does not load this repository or the Hugging Face model files directly.
+
+Updating the model repository alone does not trigger a Space rebuild. The API Space must use code compatible with the checkpoint and restart before the web app serves the new model. Once the Space is running the new release, NanoMathWeb needs no code change because its API URL stays the same.
 
 ## Tests
 
@@ -225,17 +215,21 @@ Use fewer iterations for an initial quality check. Fine-tuning the 136M checkpoi
 python -m pytest -q
 ```
 
-Tests cover legacy and modern cached-attention equivalence, weighted loss, stop tokens, and correctness of the new synthetic generators.
+The tests cover legacy and modern model construction, cached-attention equivalence, weighted loss, stop tokens, and generated-data checks.
 
-## Project layout
+Run a short cache benchmark with:
 
-- `model_architecture/`: legacy-compatible and modern Transformer components
-- `data_pipeline/`: downloads, verified synthetic generation, tokenizer training, and binary encoding
-- `train.py`: local/CUDA training and resumable checkpoints
-- `chat.py`: accelerated local CLI
-- `benchmark.py`: short cached-versus-uncached inference benchmark
-- `config.py`: `legacy`, `mac`, `kaggle`, and `tiny` profiles
-- `prepare_kaggle_dataset.py`: validates and packages local binaries plus training source
-- `kaggle-notebook.ipynb`: offline, checksum-verified single/dual-GPU Kaggle launcher
+```bash
+python benchmark.py --profile kaggle --vocab-size 16384 --new-tokens 12
+```
 
-The published model is intentionally small and still has neural reasoning limitations. Improving its arithmetic requires fine-tuning the legacy checkpoint or training a new `mac`/`kaggle` checkpoint on the improved corpus.
+## Repository layout
+
+- `model_architecture/` contains the decoder blocks, attention, and feed-forward layers.
+- `data_pipeline/` downloads source datasets, generates synthetic problems, trains the tokenizer, and packs token streams.
+- `train.py` handles local training, CUDA training, DDP, and resumable checkpoints.
+- `chat.py` loads v1.0 and v1.1 checkpoints for local inference.
+- `benchmark.py` compares cached and full-context decoding.
+- `config.py` defines the `legacy`, `mac`, `kaggle`, and `tiny` profiles.
+- `prepare_kaggle_dataset.py` builds the checksum-verified Kaggle package.
+- `kaggle-notebook.ipynb` runs the packaged trainer on one or more Kaggle GPUs.
